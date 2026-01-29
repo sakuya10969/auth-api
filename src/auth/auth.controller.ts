@@ -1,33 +1,29 @@
-import { Body, Controller, Post, Req, UseGuards } from '@nestjs/common';
-import type { Request } from 'express';
+import { Body, Controller, Post } from '@nestjs/common';
 
-import { AuthService } from 'src/auth/auth.service';
-import { AuthCredentialsDto } from 'src/auth/dto/auth.dto';
-import { JwtGuard } from 'src/auth/jwt.guard';
+import { AuthService } from '@/auth/auth.service';
+import { AuthCredentialsDto } from '@/auth/dto/auth.dto';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly auth: AuthService) {}
+  constructor(private readonly authService: AuthService) {}
 
   @Post('register')
   register(@Body() dto: AuthCredentialsDto) {
-    return this.auth.register(dto.email, dto.password);
+    return this.authService.register(dto.email, dto.password);
   }
 
   @Post('login')
-  login(@Body() dto: AuthCredentialsDto) {
-    return this.auth.login(dto.email, dto.password);
+  login(@Body() body: { email: string; password: string }) {
+    return this.authService.login(body.email, body.password);
   }
 
-  // CLI側が refreshToken を body に入れて送る想定
   @Post('refresh')
-  refresh(@Body() body: { userId: string; refreshToken: string }) {
-    return this.auth.refresh(body.userId, body.refreshToken);
+  refresh(@Body() body: { refreshToken: string }) {
+    return this.authService.refresh(body.refreshToken);
   }
 
-  @UseGuards(JwtGuard)
   @Post('logout')
-  logout(@Req() req: Request & { user: { userId: string } }) {
-    return this.auth.logout(req.user.userId);
+  logout(@Body() body: { refreshToken: string }) {
+    return this.authService.logout(body.refreshToken);
   }
 }

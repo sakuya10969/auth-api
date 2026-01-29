@@ -1,84 +1,135 @@
-import {
-  Injectable,
-  UnauthorizedException,
-  ConflictException,
-} from '@nestjs/common';
-import * as bcrypt from 'bcrypt';
+import { Injectable, UnauthorizedException, ForbiddenException, ConflictException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 
-import { UsersService } from 'src/users/users.service';
+import { PrismaService } from '@/prisma/prisma.service';
+import { generateRefreshToken, hashPassword, hashToken, verifyPassword } from '@/auth/crypto';
 
-type Tokens = { accessToken: string; refreshToken: string };
+const REFRESH_EXPIRES_DAYS = 30;
 
 @Injectable()
 export class AuthService {
   constructor(
-    private readonly usersService: UsersService,
+    private readonly prismaService: PrismaService,
     private readonly jwtService: JwtService,
   ) {}
 
-  private signTokens(userId: string, email: string): Tokens {
-    const accessToken = this.jwtService.sign(
-      { sub: userId, email },
+  private createAccessToken(userId: string) {
+    return this.jwtService.sign(
+      { sub: userId },
       { expiresIn: '15m' },
     );
-    const refreshToken = this.jwtService.sign(
-      { sub: userId, email },
-      { expiresIn: '14d' },
-    );
-    return { accessToken, refreshToken };
   }
 
-  private async hash(text: string) {
-    const saltRounds = 12;
-    return bcrypt.hash(text, saltRounds);
+  private createRefreshExpiresAt() {
+    const d = new Date();
+    d.setDate(d.getDate() + REFRESH_EXPIRES_DAYS);
+    return d;
   }
 
-  async register(email: string, password: string): Promise<Tokens> {
-    const exists = await this.usersService.findByEmail(email);
-    if (exists) throw new ConflictException('Email already used');
-
-    const passwordHash = await this.hash(password);
-    const user = await this.usersService.createUser(email, passwordHash);
-
-    const tokens = this.signTokens(user.id, user.email);
-    const refreshTokenHash = await this.hash(tokens.refreshToken);
-    await this.usersService.setRefreshTokenHash(user.id, refreshTokenHash);
-
-    return tokens;
+  async register(email: string, password: string) {
+    // すでに存在したら弾く
+    const exists = await this.prismaService.user.findUnique({ where: { email } });
+    if (exists) throw new ConflictException('Email already exists');
+  
+    const passwordHash = await hashPassword(password);
+  
+    const user = await this.prismaService.user.create({
+      data: {
+        email,
+        passwordHash,
+      },
+      select: { id: true, email: true, isActive: true },
+    });
+  
+    const accessToken = this.createAccessToken(user.id);
+  
+    const refreshPlain = generateRefreshToken();
+    const refreshHash = hashToken(refreshPlain);
+  
+    await this.prismaService.refreshToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: refreshHash,
+        expiresAt: this.createRefreshExpiresAt(),
+      },
+    });
+  
+    return { user, accessToken, refreshToken: refreshPlain };
   }
 
-  async login(email: string, password: string): Promise<Tokens> {
-    const user = await this.usersService.findByEmail(email);
-    if (!user) throw new UnauthorizedException('Invalid credentials');
+  async login(email: string, password: string) {
+    const user = await this.prismaService.user.findUnique({ where: { email } });
+    if (!user || !user.isActive) throw new UnauthorizedException('Invalid credentials');
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
+    const ok = await verifyPassword(user.passwordHash, password);
     if (!ok) throw new UnauthorizedException('Invalid credentials');
 
-    const tokens = this.signTokens(user.id, user.email);
-    const refreshTokenHash = await this.hash(tokens.refreshToken);
-    await this.usersService.setRefreshTokenHash(user.id, refreshTokenHash);
+    const accessToken = this.createAccessToken(user.id);
 
-    return tokens;
+    const refreshPlain = generateRefreshToken();
+    const refreshHash = hashToken(refreshPlain);
+
+    await this.prismaService.refreshToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: refreshHash,
+        expiresAt: this.createRefreshExpiresAt(),
+      },
+    });
+
+    return { accessToken, refreshToken: refreshPlain };
   }
 
-  async refresh(userId: string, refreshToken: string): Promise<Tokens> {
-    const user = await this.usersService.findById(userId);
-    if (!user?.refreshTokenHash) throw new UnauthorizedException('No refresh token');
+  // refresh tokenローテーション：古いのをrevokeして新しいのを発行
+  async refresh(refreshTokenPlain: string) {
+    const now = new Date();
+    const tokenHash = hashToken(refreshTokenPlain);
 
-    const ok = await bcrypt.compare(refreshToken, user.refreshTokenHash);
-    if (!ok) throw new UnauthorizedException('Invalid refresh token');
+    const stored = await this.prismaService.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
 
-    const tokens = this.signTokens(user.id, user.email);
-    // ローテーション
-    const refreshTokenHash = await this.hash(tokens.refreshToken);
-    await this.usersService.setRefreshTokenHash(user.id, refreshTokenHash);
+    if (!stored) throw new UnauthorizedException('Invalid refresh token');
+    if (stored.revokedAt) throw new UnauthorizedException('Refresh token revoked');
+    if (stored.expiresAt <= now) throw new UnauthorizedException('Refresh token expired');
+    if (!stored.user.isActive) throw new ForbiddenException('User is inactive');
 
-    return tokens;
+    const newAccess = this.createAccessToken(stored.userId);
+
+    const newRefreshPlain = generateRefreshToken();
+    const newRefreshHash = hashToken(newRefreshPlain);
+
+    await this.prismaService.$transaction([
+      this.prismaService.refreshToken.update({
+        where: { id: stored.id },
+        data: { revokedAt: now },
+      }),
+      this.prismaService.refreshToken.create({
+        data: {
+          userId: stored.userId,
+          tokenHash: newRefreshHash,
+          expiresAt: this.createRefreshExpiresAt(),
+        },
+      }),
+    ]);
+
+    return { accessToken: newAccess, refreshToken: newRefreshPlain };
   }
 
-  async logout(userId: string) {
-    await this.usersService.setRefreshTokenHash(userId, null);
-    return { ok: true };
+  // refresh token一本ログアウト
+  async logout(refreshTokenPlain: string) {
+    const tokenHash = hashToken(refreshTokenPlain);
+    await this.prismaService.refreshToken.updateMany({
+      where: { tokenHash, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  async logoutAll(userId: string) {
+    await this.prismaService.refreshToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
   }
 }
