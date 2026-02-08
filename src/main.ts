@@ -1,13 +1,27 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import helmet from 'helmet';
 
 import { AppModule } from '@/app.module';
 
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'] as const;
+
+function validateEnv() {
+  const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  }
+}
+
 async function bootstrap() {
+  validateEnv();
+
   const app = await NestFactory.create(AppModule);
 
-  // Global settings
+  app.use(helmet());
+  app.enableCors({ origin: true }); // 本番では origin を制限すること
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,

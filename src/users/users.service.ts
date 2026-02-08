@@ -29,6 +29,7 @@ export class UsersService {
   async findActiveUserById(id: string) {
     return this.prismaService.user.findFirst({
       where: { id, isActive: true },
+      select: { id: true, email: true, isActive: true, createdAt: true },
     });
   }
 

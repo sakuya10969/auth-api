@@ -2,9 +2,8 @@ import { Injectable, UnauthorizedException, ForbiddenException, ConflictExceptio
 import { JwtService } from '@nestjs/jwt';
 
 import { PrismaService } from '@/prisma/prisma.service';
+import { AUTH_CONFIG } from '@/auth/auth.config';
 import { generateRefreshToken, hashPassword, hashToken, verifyPassword } from '@/auth/crypto';
-
-const REFRESH_EXPIRES_DAYS = 30;
 
 @Injectable()
 export class AuthService {
@@ -16,13 +15,13 @@ export class AuthService {
   private createAccessToken(userId: string) {
     return this.jwtService.sign(
       { sub: userId },
-      { expiresIn: '15m' },
+      { expiresIn: AUTH_CONFIG.accessTokenExpiresIn },
     );
   }
 
   private createRefreshExpiresAt() {
     const d = new Date();
-    d.setDate(d.getDate() + REFRESH_EXPIRES_DAYS);
+    d.setDate(d.getDate() + AUTH_CONFIG.refreshTokenExpiresDays);
     return d;
   }
 
@@ -130,6 +129,36 @@ export class AuthService {
     await this.prismaService.refreshToken.updateMany({
       where: { userId, revokedAt: null },
       data: { revokedAt: new Date() },
+    });
+  }
+
+  async changePassword(userId: string, currentPassword: string, newPassword: string) {
+    const user = await this.prismaService.user.findUnique({ where: { id: userId } });
+    if (!user || !user.isActive) throw new UnauthorizedException('Invalid credentials');
+
+    const ok = await verifyPassword(user.passwordHash, currentPassword);
+    if (!ok) throw new UnauthorizedException('Invalid current password');
+
+    const passwordHash = await hashPassword(newPassword);
+    await this.prismaService.user.update({
+      where: { id: userId },
+      data: { passwordHash },
+    });
+  }
+
+  async changeEmail(userId: string, newEmail: string, password: string) {
+    const user = await this.prismaService.user.findUnique({ where: { id: userId } });
+    if (!user || !user.isActive) throw new UnauthorizedException('Invalid credentials');
+
+    const ok = await verifyPassword(user.passwordHash, password);
+    if (!ok) throw new UnauthorizedException('Invalid password');
+
+    const exists = await this.prismaService.user.findUnique({ where: { email: newEmail } });
+    if (exists) throw new ConflictException('Email already in use');
+
+    await this.prismaService.user.update({
+      where: { id: userId },
+      data: { email: newEmail },
     });
   }
 }
